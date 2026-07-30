@@ -65,6 +65,15 @@ jobs:
         working-directory: ./src-win
         run: cargo check --all-targets
 
+      # tauri-build validates that every bundle resource listed in
+      # tauri.conf.json exists on disk, even under plain `cargo check`. The
+      # real src-win.exe is gitignored and this job deliberately does not
+      # build it, so an empty placeholder stands in for it.
+      - name: Stub the src-win resource
+        shell: bash
+        run: |
+          [ -f src-tauri/resources/src-win.exe ] || touch src-tauri/resources/src-win.exe
+
       - name: cargo check (src-tauri)
         working-directory: ./src-tauri
         run: cargo check --all-targets
