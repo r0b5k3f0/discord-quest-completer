@@ -1,0 +1,29 @@
+{
+  "_comment": "Community-maintained data for games whose Discord detectable entry no longer ships the 'executables' field. 'steam_app_id' + 'install_dir' + 'exe_names' mirror what SteamDB lists for the game (see https://steamdb.info/app/<steam_app_id>/config/). See GitHub issue #48 for background.",
+  "overrides": [
+    {
+      "app_id": "1451409609632911453",
+      "name": "Marathon",
+      "steam_app_id": "3065800",
+      "install_dir": "Marathon",
+      "exe_names": ["Marathon.exe", "MarathonLauncher.exe"],
+      "note": "Verified working in issue #48 (Mar-2026). Marathon.exe is the game binary, MarathonLauncher.exe is Steam's default launch option."
+    },
+    {
+      "app_id": "1445163122284429375",
+      "name": "Forza Horizon 6",
+      "steam_app_id": "2483190",
+      "install_dir": "ForzaHorizon6",
+      "exe_names": ["forzahorizon6.exe"],
+      "note": "From SteamDB launch options (Jul-2026)."
+    },
+    {
+      "app_id": "1428180244241584269",
+      "name": "Enginefall",
+      "steam_app_id": "2437390",
+      "install_dir": "Coltrane",
+      "exe_names": ["start_protected_game.exe"],
+      "note": "From SteamDB launch options (Jul-2026). Install dir is the internal codename 'Coltrane'."
+    }
+  ]
+}

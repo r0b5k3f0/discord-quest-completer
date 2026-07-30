@@ -44,7 +44,7 @@
 <script setup lang="ts">
 import { EXECUTABLE_OS, GameActionsKey } from '@/constants/constants';
 import { GameActionsProvider, type Game, type GameExecutable } from '@/types/types';
-import { path, app } from '@tauri-apps/api';
+import { path } from '@tauri-apps/api';
 import { computed, inject } from 'vue';
 
 const props = defineProps<{
@@ -63,81 +63,53 @@ const filteredExecutables = computed(() => {
     return props.game.executables.filter(executable => {
         // currently no support for linux and darwin
         return executable.os !== EXECUTABLE_OS.LINUX && executable.os !== EXECUTABLE_OS.DARWIN
-            && !isValidPath(executable.name);
+            && !hasIllegalChars(executable.name);
     });
 });
 
+const PATH_SEPARATOR = /\\|\//;
+
+/** Breadcrumb sections for an executable path, with the extension stripped off
+ *  the last one. */
 function splitExecutableName(executable: GameExecutable) {
-    const allSections = executable.name.split(/\\|\//);
-    
-    const last = executable.name.split(/\\|\//).pop();
-    // remove file extension if there was none, just return the last section
+    const sections = executable.name.split(PATH_SEPARATOR);
+    const last = sections[sections.length - 1];
+    // Keep the last section as-is when it carries no extension.
     const name = last?.split('.').slice(0, -1).join('.') || last;
     return [
-        ...allSections.slice(0, -1),
+        ...sections.slice(0, -1),
         name,
     ];
 }
 
-function getExecutablePath(executable: GameExecutable) {
-    const allSections = executable.name.split(/\\|\//);
-    const last = executable.name.split(/\\|\//).pop();
-    // remove file extension if there was none, just return the last section
-    const name = last?.split('.').slice(0, -1).join('.') || last;
-    return [
-        ...allSections.slice(0, -1)
-    ].join(path.sep())
+/** The launch payload the parent needs: the directory the dummy exe goes in
+ *  and its file name. */
+function toLaunchPayload(executable: GameExecutable): GameExecutable {
+    const sections = executable.name.split(PATH_SEPARATOR);
+    return {
+        // Spread first: the computed fields below must win over anything the
+        // source object happens to carry.
+        ...executable,
+        path: sections.slice(0, -1).join(path.sep()),
+        filename: sections[sections.length - 1],
+    };
 }
 
-function getFilename(executable: GameExecutable) {
-    const last = executable.name.split(/\\|\//).pop();
-    // remove file extension if there was none, just return the last section
-    return last;
-}
-
-function isValidPath(path: string) {
+function hasIllegalChars(name: string) {
     const illegalChars = ['>', '<', ':', '"', '|', '?', '*'];
-    return illegalChars.some(char => path.includes(char));
+    return illegalChars.some(char => name.includes(char));
 }
 
 function handleLaunch(executable: GameExecutable) {
-    // Handle the launch logic here
-    console.log('Launching game:', props.game);
-    if(executable.is_running) {
-        emit('stop', {
-            game: props.game,
-            executable: {
-                path: getExecutablePath(executable),
-                segments: splitExecutableName(executable).length,
-                filename: getFilename(executable),
-                ...executable
-            },
-        });
+    const payload = { game: props.game, executable: toLaunchPayload(executable) };
+
+    if (executable.is_running) {
+        emit('stop', payload);
+    } else if (!gameActions?.isGameExecutableInstalled(executable)) {
+        emit('install_and_play', payload);
     } else {
-        if (!gameActions?.isGameExecutableInstalled(executable)) {
-            emit('install_and_play', {
-                game: props.game,
-                executable: {
-                    path: getExecutablePath(executable),
-                    segments: splitExecutableName(executable).length,
-                    filename: getFilename(executable),
-                    ...executable
-                },
-            });
-        } else {
-            emit('play', {
-                game: props.game,
-                executable: {
-                    path: getExecutablePath(executable),
-                    segments: splitExecutableName(executable).length,
-                    filename: getFilename(executable),
-                    ...executable
-                },
-            });
-        }
-     
+        emit('play', payload);
     }
-    
 }
 
 </script>

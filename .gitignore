@@ -26,3 +26,11 @@ dist-ssr
 _target
 # Exclude binaries and executables these are built by the build process
 src-tauri/resources/*.exe
+
+# Packaged release output
+dist-release
+
+# The detectable-games list is ~12 MB and is fetched by CI at build time.
+# Keeping it out of the repo (it never was tracked) also stops it from being
+# committed by accident.
+src/assets/gamelist.json

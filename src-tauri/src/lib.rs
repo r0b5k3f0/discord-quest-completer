@@ -1,23 +1,62 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use once_cell::sync::OnceCell;
 use std::env;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+use tauri::async_runtime::JoinHandle;
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Listener, Manager};
 
+mod gamelist;
 mod rpc;
 mod runner;
+mod steam;
 
-// Global static instance of the Discord client
-static DISCORD_CLIENT: OnceCell<Mutex<Option<rpc::Client>>> = OnceCell::new();
+const EVENT_CONNECTING: &str = "client_connecting";
+const EVENT_CONNECTED: &str = "client_connected";
+const EVENT_ERROR: &str = "client_error";
+const EVENT_DISCONNECT: &str = "event_disconnect";
 
-fn get_discord_client() -> &'static Mutex<Option<rpc::Client>> {
-    DISCORD_CLIENT.get_or_init(|| Mutex::new(None))
+/// The single live Discord RPC session, if any.
+static DISCORD_CLIENT: Mutex<Option<rpc::Client>> = Mutex::new(None);
+/// The in-flight connect task, so a disconnect can cancel a pending connect.
+static CONNECT_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+/// A poisoned mutex here only means a previous connect panicked; the data behind
+/// it stays perfectly usable, so recover instead of cascading the panic.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+/// Takes the current client out of the global slot and closes its connection.
+/// A no-op when nothing is connected.
+async fn disconnect_current_client() {
+    // The guard must be dropped before the await, hence the inner scope.
+    let client = { lock(&DISCORD_CLIENT).take() };
+    if let Some(client) = client {
+        client.discord.disconnect().await;
+        println!("Disconnected from Discord RPC");
+    }
+}
+
+fn abort_pending_connect() {
+    if let Some(task) = lock(&CONNECT_TASK).take() {
+        task.abort();
+    }
+}
+
+/// Resolves `<exe dir>/games/<app_id>/<path>`, the folder a dummy executable
+/// lives in.
+fn game_folder_path(app_id: i64, path: &str) -> std::path::PathBuf {
+    // Must be created next to the executable to avoid permission issues.
+    let exe_path = env::current_exe().unwrap_or_default();
+    let exe_dir = exe_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+
+    exe_dir
+        .join("games")
+        .join(app_id.to_string())
+        .join(Path::new(path).to_string_lossy().to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -25,51 +64,32 @@ async fn create_fake_game(
     handle: tauri::AppHandle,
     path: &str,
     executable_name: &str,
-    path_len: i64,
     app_id: i64,
 ) -> Result<String, String> {
-    // Must create in the same directory as the executable to avoid permission issues
-    // Get the executable directory to look for config file
-    let exe_path: std::path::PathBuf = env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new(""));
-
-    let normalized_path = Path::new(path).to_string_lossy().to_string();
-
-    let game_folder_path = exe_dir
-        .join("games")
-        .join(app_id.to_string())
-        .join(normalized_path);
+    let game_folder_path = game_folder_path(app_id, path);
+    let target_executable_path = game_folder_path.join(executable_name);
 
     println!("Game folder path: {:?}", game_folder_path);
-    println!(
-        "Game full path: {:?}",
-        game_folder_path.join(executable_name)
-    );
+    println!("Game full path: {:?}", target_executable_path);
 
-    // Ok(format!("Dummy executable copied to: {:?}", target_executable_path))
-    match std::fs::create_dir_all(&game_folder_path) {
-        Ok(_) => {
-            println!("Successfully created directory: {:?}", game_folder_path);
-        }
-        Err(e) => return Err(format!("Failed to create game folder: {}", e)),
-    };
-    // copy the dummy executable to the created folder
-    // there is a `template.exe` file along the final build.
+    std::fs::create_dir_all(&game_folder_path)
+        .map_err(|e| format!("Failed to create game folder: {}", e))?;
+
+    // Copy the dummy executable into the folder we just created. It ships
+    // alongside the final build as `data/src-win.exe`.
     let resource_path = handle
         .path()
         .resolve("data/src-win.exe", BaseDirectory::Resource)
-        .unwrap_or_default();
+        .map_err(|e| format!("Failed to resolve the dummy executable resource: {}", e))?;
 
     println!("Creating dummy game executable: {:?}", resource_path);
-    let dummy_executable_path = exe_dir.join("template.exe");
-    let target_executable_path = game_folder_path.join(executable_name);
-    match std::fs::copy(&resource_path, &target_executable_path) {
-        Ok(_) => Ok(format!(
-            "Dummy executable copied to: {:?}",
-            target_executable_path
-        )),
-        Err(e) => Err(format!("Failed to copy dummy executable: {}", e)),
-    }
+    std::fs::copy(&resource_path, &target_executable_path)
+        .map_err(|e| format!("Failed to copy dummy executable: {}", e))?;
+
+    Ok(format!(
+        "Dummy executable copied to: {:?}",
+        target_executable_path
+    ))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -77,29 +97,18 @@ async fn run_background_process(
     name: &str,
     path: &str,
     executable_name: &str,
-    path_len: i64,
     app_id: i64,
 ) -> Result<String, String> {
-    let exe_path = env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new(""));
-
-    let normalized_path = Path::new(path).to_string_lossy().to_string();
-
-    let game_folder_path = exe_dir
-        .join("games")
-        .join(app_id.to_string())
-        .join(normalized_path);
+    let game_folder_path = game_folder_path(app_id, path);
     let executable_path = game_folder_path.join(executable_name);
-    // const DETACHED_PROCESS: u32 = 0x00000008;
-    // const CREATE_NO_WINDOW: u32 = 0x08000000; // Hide the window
-    match std::process::Command::new(&executable_path)
+
+    std::process::Command::new(&executable_path)
         .args(["--title", name])
         .current_dir(game_folder_path) // Set working directory to the game folder
         .spawn()
-    {
-        Ok(_) => Ok("Process started successfully".to_string()),
-        Err(e) => Err(format!("Failed to start process: {}", e)),
-    }
+        .map_err(|e| format!("Failed to start process: {}", e))?;
+
+    Ok("Process started successfully".to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -122,109 +131,90 @@ async fn stop_process(exec_name: String) -> Result<(), String> {
     }
 }
 
-/// Usage: Calling from JS:
+/// Connects to (or disconnects from) Discord's RPC socket.
+///
+/// Connecting is asynchronous: this returns as soon as the attempt has been
+/// scheduled, and the outcome is reported through the `client_connected` /
+/// `client_error` events.
+///
+/// Usage from JS:
 /// ```javascript
-/// await invoke('connect_to_discord_rpc_3', json, 'connect' | 'disconnect');
+/// await invoke('connect_to_discord_rpc_3', { activity_json, action: 'connect' | 'disconnect' });
+/// ```
 #[tauri::command(rename_all = "snake_case")]
-fn connect_to_discord_rpc_3(handle: AppHandle, activity_json: String, action: String) {
-    let app = handle.clone();
+fn connect_to_discord_rpc_3(
+    handle: AppHandle,
+    activity_json: String,
+    action: String,
+) -> Result<(), String> {
+    if action == "disconnect" {
+        abort_pending_connect();
+        tauri::async_runtime::spawn(disconnect_current_client());
+        return Ok(());
+    }
 
-    let event_connecting = "client_connecting";
-    let event_connected = "client_connected";
-    let event_disconnect = "event_disconnect";
-    let event_connect = "event_connect";
+    // Validate up front so a malformed payload rejects the invoke call instead
+    // of panicking inside the spawned task, where nothing can observe it.
+    let app_id = runner::parse_activity_json(&activity_json)?.app_id;
 
-    let activity = runner::parse_activity_json(&activity_json).unwrap();
-
-    let connecting_payload = serde_json::json!({
-        "app_id": activity.app_id,
-    });
-
-    let client_option = {
-        let mut client_guard = get_discord_client().lock().unwrap();
-        // Take the client out, leaving None in its place
-        client_guard.take()
-        // MutexGuard is dropped here at the end of scope
-    };
+    abort_pending_connect();
 
     let task = tauri::async_runtime::spawn(async move {
-        handle
-            .emit(event_connecting, connecting_payload)
-            .unwrap_or_else(|e| eprintln!("Failed to emit event: {}", e));
+        // Close any previous session first. Dropping the client without
+        // disconnecting leaves the old Discord IPC connection open.
+        disconnect_current_client().await;
 
-        let client = runner::set_activity(activity_json)
-            .await
-            .map_err(|e| {
-                println!("Failed to set activity: {}", e);
-            })
-            .unwrap();
+        let _ = handle.emit(EVENT_CONNECTING, serde_json::json!({ "app_id": &app_id }));
 
-        let connected_payload = serde_json::json!({
-            "app_id": activity.app_id,
-        });
-
-        {
-            let mut client_guard = get_discord_client().lock().unwrap();
-            *client_guard = Some(client);
+        match runner::set_activity(activity_json).await {
+            Ok(client) => {
+                *lock(&DISCORD_CLIENT) = Some(client);
+                let _ = handle.emit(EVENT_CONNECTED, serde_json::json!({ "app_id": &app_id }));
+            }
+            Err(e) => {
+                eprintln!("Failed to set activity: {}", e);
+                let _ = handle.emit(
+                    EVENT_ERROR,
+                    serde_json::json!({ "app_id": &app_id, "message": e }),
+                );
+            }
         }
-
-        handle
-            .emit(event_connected, connected_payload)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to emit event: {}", e);
-            });
-
-        handle.listen(event_disconnect, move |_| {
-            println!("Disconnecting from Discord RPC inner");
-            let disconnect_task = tauri::async_runtime::spawn(async move {
-                let client_option = {
-                    let mut client_guard = get_discord_client().lock().unwrap();
-                    // Take the client out, leaving None in its place
-                    client_guard.take()
-                    // MutexGuard is dropped here at the end of scope
-                };
-                if let Some(client) = client_option {
-                    client.discord.disconnect().await;
-                    println!("Disconnected from Discord RPC inner");
-                }
-            });
-            // disconnect_task.abort();
-        });
     });
 
-    app.listen(event_disconnect, move |_| {
-        println!("Disconnecting from Discord RPC...");
-        task.abort();
-    });
+    *lock(&CONNECT_TASK) = Some(task);
+    Ok(())
 }
-
-#[tauri::command(rename_all = "snake_case")]
-async fn fetch_gamelist_gh_mirror() -> tauri::ipc::Response {
-    let res = tauri_plugin_http::reqwest::get("https://markterence.github.io/discord-quest-completer/detectable.json").await;
-    tauri::ipc::Response::new(res.unwrap().text().await.unwrap())
-}
-
-#[tauri::command(rename_all = "snake_case")]
-async fn fetch_gamelist_from_discord() -> tauri::ipc::Response {
-    let res = tauri_plugin_http::reqwest::get("https://discord.com/api/applications/detectable").await;
-    tauri::ipc::Response::new(res.unwrap().text().await.unwrap())
-}
-
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // No `tauri_plugin_http::init()`: the frontend never calls the plugin's
+        // fetch commands. The Rust side only uses the reqwest re-export, which
+        // does not need the plugin to be registered.
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            // Registered exactly once for the lifetime of the app. Registering
+            // it per connect meant a single disconnect event fired one handler
+            // per connect that had ever happened.
+            app.handle().listen(EVENT_DISCONNECT, |_| {
+                println!("Disconnecting from Discord RPC...");
+                abort_pending_connect();
+                tauri::async_runtime::spawn(disconnect_current_client());
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            greet,
             create_fake_game,
             stop_process,
             connect_to_discord_rpc_3,
             run_background_process,
-            fetch_gamelist_gh_mirror,
-            fetch_gamelist_from_discord
+            gamelist::fetch_gamelist,
+            steam::find_steam_libraries,
+            steam::install_steam_dummy_game,
+            steam::get_steam_dummy_status,
+            steam::remove_steam_dummy_game,
+            steam::run_steam_dummy_game
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

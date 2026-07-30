@@ -42,52 +42,73 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      # Covers the cargo registry, the git index and both target directories.
+      # Must come before any cargo invocation, otherwise that build is not
+      # cached — src-win used to be compiled from scratch on every run.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
-      
-      - name: Cache Cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-index-
+          workspaces: |
+            ./src-tauri -> target
+            ./src-win -> target
 
       - name: Get Game List
         shell: bash
         env:
           GAME_LIST_URL: ${{ secrets.GAME_LIST_URL }}
         run: |
-          curl -L -o src/assets/gamelist.json $GAME_LIST_URL
-          if [ ! -f src/assets/gamelist.json ]; then
-            echo "Failed to download game list"
+          # The game list is not committed to the repo. GAME_LIST_URL is
+          # optional: without it the public mirror the app itself uses is
+          # tried, then Discord directly.
+          mkdir -p src/assets
+          sources=()
+          if [ -n "${GAME_LIST_URL:-}" ]; then
+            sources+=("$GAME_LIST_URL")
+          fi
+          sources+=("https://markterence.github.io/discord-quest-completer/detectable.json")
+          sources+=("https://discord.com/api/applications/detectable")
+
+          for url in "${sources[@]}"; do
+            echo "Trying $url"
+            if curl -fsSL --retry 3 --retry-delay 5 -o gamelist.raw.json "$url" && [ -s gamelist.raw.json ]; then
+              echo "Fetched the game list from $url"
+              break
+            fi
+          done
+
+          if [ ! -s gamelist.raw.json ]; then
+            echo "::error::Could not obtain a game list from any source"
             exit 1
           fi
+          # Keep only the fields the app reads. The upstream list ships 14
+          # fields per entry (~12 MB); this is the fallback that gets bundled
+          # into the binary, so the other 9 are pure dead weight.
+          jq -c '[.[] | {
+                   id,
+                   name,
+                   aliases: (.aliases // []),
+                   executables: [ (.executables // [])[] | { is_launcher, name, os } ],
+                   third_party_skus: (.third_party_skus // [])
+                 }]' gamelist.raw.json > src/assets/gamelist.json
           if [ ! -s src/assets/gamelist.json ]; then
-            echo "Game list is empty"
+            echo "Game list is empty after filtering"
             exit 1
           fi
-      
+          echo "Bundled game list: $(wc -c < src/assets/gamelist.json) bytes (raw: $(wc -c < gamelist.raw.json) bytes)"
+          rm gamelist.raw.json
+
       # Build src-win
       - name: Build src-win project x86_64 binary
         if: matrix.platform == 'windows-latest'
         shell: bash
-        run: | 
+        run: |
           cd src-win
           cargo build --release --verbose
           cd ..
           cp ./src-win/target/release/src-win.exe ./src-tauri/resources/src-win.exe
 
-      - name: Rust cache (Tauri App)
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
-    
       - name: install frontend dependencies
-        run: pnpm install
+        run: pnpm install --no-frozen-lockfile
 
       - uses: tauri-apps/tauri-action@v0
         env:

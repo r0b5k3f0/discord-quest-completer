@@ -1,6 +1,6 @@
 [package]
 name = "discord-quest-completer"
-version = "25.10.7"
+version = "26.7.30"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -23,9 +23,21 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 discord-sdk = "0.4.0"
-tokio = "1.44.2"
-once_cell = "1.21.3"
 tauri-plugin-http = "2"
 tauri-plugin-dialog = "2"
-reqwest = { version = "=0.11", features = ["json", "multipart", "brotli", "gzip", "blocking"] }
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+# The default release profile ships a considerably larger binary than needed for
+# an app whose Rust side only does IPC and file system work. Note that this
+# deliberately does *not* set `panic = "abort"`: parts of the Tauri/wry stack
+# rely on unwinding.
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = true           # Link time optimization across the whole dependency graph
+codegen-units = 1    # Slower builds, smaller and faster output
+strip = true         # Drop symbols from the shipped binary
+
+[profile.release.package."*"]
+opt-level = "z"

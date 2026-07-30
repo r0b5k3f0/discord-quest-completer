@@ -1,17 +1,16 @@
 <script setup lang="ts">
-import { ref, computed, useTemplateRef, shallowRef, provide, nextTick, triggerRef } from 'vue';
-// import gameListData from '../assets/gamelist.json';
-import { onClickOutside, refDebounced, tryOnMounted } from '@vueuse/core';
+import { ref, computed, useTemplateRef, shallowRef, provide, onUnmounted } from 'vue';
+import { onClickOutside, refDebounced } from '@vueuse/core';
 import { useFuse } from '@vueuse/integrations/useFuse'
 import { invoke } from '@tauri-apps/api/core';
 import { randomString } from '@/utils/random-string';
 import { GameActionsProvider, GameExecutable, type Game } from '@/types/types';
 import IconVerified from '@/components/IconVerified.vue';
-import { isEmpty } from 'lodash-es';
 import GameExecutables from '@/components/GameExecutables.vue';
+import SteamQuestHelper from '@/components/SteamQuestHelper.vue';
+import { gameHasWindowsExecutables } from '@/utils/steam-overrides';
 import { GameActionsKey } from '@/constants/constants';
-import { path } from '@tauri-apps/api';
-import { emit } from '@tauri-apps/api/event';
+import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useFetchGameList } from '@/composables/fetch-gamelist';
 import { UseFuseOptions } from '@vueuse/integrations';
 import Fuse from 'fuse.js';
@@ -19,13 +18,10 @@ import { useGlobalState } from '@/composables/app-state';
 import TimedNotification from '@/components/TimedNotification.vue';
 
 
-type DialogKey = 
-    'none' | 
+type DialogKey =
+    'none' |
     'rpc_message_1'|
-    'no_game_selected';;
-
-// Game list from JSON file
-// const gameDB = ref<Game[]>([]);
+    'no_game_selected';
 
 const {
     gameDB,
@@ -46,8 +42,6 @@ const shouldShowNotificationContainer = computed(() => {
 
 const dialogRef = useTemplateRef<HTMLDialogElement>('dialogRef');
 const searchResultContainerRef = useTemplateRef<HTMLElement>('searchResultContainerRef')
-const dialogMessage = ref('');
-const isDialogOpen = ref(false);
 const dialogKey = ref<DialogKey>('none')
 const isConnectedToRPC = ref(false);
 const isConnecting = ref(false);
@@ -57,7 +51,6 @@ const searchQuery = shallowRef('');
 const debouncedSearchQuery = refDebounced(searchQuery, 300)
 
 const searchResultsIsOpen = ref(false);
-const isOnSearchResults = ref(false);
 
 // Game status
 const currentlyPlaying = ref<string | null>(null);
@@ -66,15 +59,6 @@ const currentlyPlaying = ref<string | null>(null);
 onClickOutside(searchResultContainerRef, () => {
     searchResultsIsOpen.value = false;
 })
-
-// const searchResults = computed(() => {
-//     if (!debouncedSearchQuery.value) return [];
-//     const query = debouncedSearchQuery.value.toLowerCase();
-//     return gameDB.value.filter(game =>
-//         game.name.toLowerCase().includes(query) ||
-//         game.aliases?.some(alias => alias.toLowerCase().includes(query))
-//     );
-// });
 
 const COPYRIGHT_SYMBOL = '\u00A9';
 const TRADEMARK_SYMBOL = '\u2122';
@@ -109,15 +93,23 @@ const { results: searchResults } = useFuse(debouncedSearchQuery, gameDB, fuseOpt
 
 // Selected games list
 const gameList = ref<Game[]>([]);
-// const selectedGame = ref<Game | null>(null);
 const selectedGameId = ref<string | null | undefined>(null);
 
 const selectedGame = computed(() => {
     if (!selectedGameId.value) return null;
-    const found = gameList.value.find(g => g.uid === selectedGameId.value);
-    console.log('selectedGame computed - selectedGameId:', selectedGameId.value, 'found:', found);
-    return found || null;
+    return gameList.value.find(g => g.uid === selectedGameId.value) || null;
 });
+
+// Discord no longer ships the `executables` field for many new games (issue #48).
+// Those need the Steam workaround instead of the plain dummy-exe flow.
+const selectedGameHasWinExes = computed(() => gameHasWindowsExecutables(selectedGame.value));
+
+function handleSteamRunningChange({ running }: { running: boolean, name: string | null }) {
+    if (selectedGame.value) {
+        selectedGame.value.is_running = running;
+    }
+    currentlyPlaying.value = running ? (selectedGame.value?.id ?? null) : null;
+}
 
 function closeSearchResults() {
     searchResultsIsOpen.value = false;
@@ -130,38 +122,30 @@ function openSearchResults() {
 function addGameToList(game: Game) {
     if (!gameList.value.some(g => g.id === game.id)) {
         gameList.value.push({
+            ...game,
             uid: randomString(),
-            ...game
+            // The entries themselves come straight out of the shared game list,
+            // so the executables have to be copied before this view starts
+            // writing is_running / is_installed onto them.
+            executables: game.executables.map(exe => ({ ...exe })),
         });
     }
 
     closeSearchResults();
 }
 
-const forceRerenderKey = ref(0); 
 // Function to remove a game from the selected list
 function removeGameFromList(game: Game) {
     const gameId = game.uid;
     gameList.value = gameList.value.filter(game => game.uid !== gameId);
-    if (selectedGame.value?.uid === gameId) { 
-        // selectedGame.value = null;
+    if (selectedGameId.value === gameId) {
         selectedGameId.value = null;
-        forceRerenderKey.value++; 
     }
 }
 
 function selectGame(game: Game) {
-    // selectedGame.value = game;
     selectedGameId.value = game?.uid;
     searchResultsIsOpen.value = false;
-}
-
-function canCreateDummyGame(game: Game | null) {
-    if (!game) {
-        return false;
-    }
-    // we can only create a dummy game if the game is not installed or game is not running
-    return !game.is_installed
 }
 
 function canPlayGame(game: Game | null) {
@@ -199,19 +183,21 @@ async function createDummyGame(game: Game | null, executable: GameExecutable) {
     const gameToInstall = gameList.value.find(g => g.uid === gameUid);
     const executableItem = gameToInstall?.executables.find(exe => exe.name === executable.name);
     if (gameToInstall && executableItem) {
-        const payload =  { 
-            path: executable.path,
-            executable_name: executable.filename,
-            path_len: executable.segments,
-            app_id: Number(gameToInstall.id),
+        try {
+            await invoke('create_fake_game', {
+                path: executable.path,
+                executable_name: executable.filename,
+                app_id: Number(gameToInstall.id),
+            });
+        } catch (error) {
+            addLog('error', `Failed to create dummy game: ${String(error)}`);
+            return false;
         }
-        console.log(payload);
-        const result = await invoke('create_fake_game', payload)
-        console.log('Game created:', result);
         gameToInstall.is_installed = true;
         executableItem.is_installed = true;
         return true;
     }
+    return false;
 }
 
 
@@ -221,10 +207,9 @@ async function installAndPlay({game, executable}: {game: Game, executable: GameE
     }
     const gameCreated = await createDummyGame(game, executable);
     if (gameCreated) {
-        playGame({game, executable});
+        await playGame({game, executable});
     } else {
-        console.error('Failed to create game');
-        addLog('error', 'Failed to create game');
+        addLog('error', `Failed to create the dummy game for ${game.name}`);
     }
 }
 // Play game function
@@ -234,7 +219,6 @@ async function playGame({game, executable}: {game: Game, executable: GameExecuta
     }
     const gameUid = game.uid;
     try {
-        console.log(`Playing game: ${gameUid}`);
         addLog('info', `Playing game: ${game.name}`);
         addLog('info', `Executable: ${executable.name}`);
         currentlyPlaying.value = game.id;
@@ -242,22 +226,18 @@ async function playGame({game, executable}: {game: Game, executable: GameExecuta
         const gameToPlay = gameList.value.find(g => g.uid === gameUid);
         const executableItem = gameToPlay?.executables.find(exe => exe.name === executable.name);
         if (gameToPlay && executableItem) {
-            const payload =  { 
+            await invoke('run_background_process', {
                 name: game.name,
                 path: executable.path,
                 executable_name: executable.filename,
-                path_len: executable.segments,
                 app_id: Number(gameToPlay.id),
-                exec_path: path.join(executable.path!, executable.filename!),
-            } 
-            await invoke('run_background_process', payload);
+            });
             gameToPlay.is_running = true;
-            executableItem.is_running = true; 
+            executableItem.is_running = true;
         }
-        // In a real app, this would invoke a Tauri command to launch the game
-       
     } catch (error) {
-        console.error('Failed to launch game:', error);
+        currentlyPlaying.value = null;
+        addLog('error', `Failed to launch game: ${String(error)}`);
     }
 }
 
@@ -266,9 +246,8 @@ async function stopPlaying({game, executable}: {game: Game, executable: GameExec
     if (!game) {
         return;
     }
-    console.log('Stopped playing game');
     const gameUid = game.uid;
-    
+
     currentlyPlaying.value = null;
 
     const gameToPlay = gameList.value.find(g => g.uid === gameUid);
@@ -281,45 +260,80 @@ async function stopPlaying({game, executable}: {game: Game, executable: GameExec
             addLog('info', `Stopped game process: ${game.name}`);
             addLog('info', `Stopped Executable: ${executable.name}`);
         } catch (error) {
-            console.error('Failed to stop game process:', error);
             const errorMessage = (error instanceof Error) ? error.message : String(error);
-            addLog('error', 'Failed to stop game process' + errorMessage);
-            // Even if stopping fails, we still update the state
-            gameToPlay.is_running = false;
-            executableItem.is_running = false;
+            addLog('error', 'Failed to stop game process: ' + errorMessage);
         } finally {
+            // Even if stopping failed, the process is no longer ours to track.
             gameToPlay.is_running = false;
             executableItem.is_running = false;
         }
     }
 }
 
-function getExecutables(game: Game) {
-    return game.executables.map(exe => exe.name)
+// ---------------------------------------------------------------------------
+// Discord RPC
+//
+// `connect_to_discord_rpc_3` only schedules the connection attempt, so the
+// actual outcome arrives as an event. Flipping the UI to "connected" straight
+// after the invoke resolved used to claim success even when Discord was closed.
+// ---------------------------------------------------------------------------
+const rpcAppId = ref<string | null>(null);
+const unlistenFns: UnlistenFn[] = [];
+let disposed = false;
+
+// `listen` resolves asynchronously, so a subscription can land after unmount.
+function trackUnlisten(un: UnlistenFn) {
+    if (disposed) un();
+    else unlistenFns.push(un);
+}
+
+listen<{ app_id: string }>('client_connected', ({ payload }) => {
+    isConnecting.value = false;
+    isConnectedToRPC.value = true;
+    rpcAppId.value = payload?.app_id ?? null;
+    const game = gameList.value.find(g => g.id === rpcAppId.value);
+    if (game) {
+        game.is_running = true;
+        currentlyPlaying.value = game.id;
+    }
+    addLog('info', 'Connected to Discord Gateway.');
+}).then(trackUnlisten);
+
+listen<{ message: string }>('client_error', ({ payload }) => {
+    isConnecting.value = false;
+    isConnectedToRPC.value = false;
+    resetRPCGameState();
+    addLog('error', `Discord RPC failed: ${payload?.message ?? 'unknown error'}`);
+}).then(trackUnlisten);
+
+onUnmounted(() => {
+    disposed = true;
+    unlistenFns.forEach(un => un());
+    unlistenFns.length = 0;
+});
+
+function resetRPCGameState() {
+    const game = gameList.value.find(g => g.id === rpcAppId.value);
+    if (game) {
+        game.is_running = false;
+    }
+    if (currentlyPlaying.value === rpcAppId.value) {
+        currentlyPlaying.value = null;
+    }
+    rpcAppId.value = null;
 }
 
 async function handleTestRPC(game: Game | null) {
-    let state = isConnectedToRPC.value ? 'disconnect' : 'connect';
-
-    console.log('Testing RPC for game:', game);
-    if (!game && state === 'connect') {
-        showDialog('no_game_selected');
+    if (isConnectedToRPC.value || isConnecting.value) {
+        emit('event_disconnect');
+        isConnectedToRPC.value = false;
+        isConnecting.value = false;
+        resetRPCGameState();
+        addLog('info', 'Disconnected from Discord Gateway.');
         return;
     }
-    if (state === 'disconnect' || isConnecting.value) {
-        // await invoke('connect_to_discord_rpc_2', { app_id: "0", discord_state: "disconnect" })
-        // invoke('connect_to_discord_rpc_3', {
-        //     activity_json: JSON.stringify({
-        //         app_id: selectedGame.value?.id
-        //     }),
-        //     action: 'disconnect',
-        // })
-        emit('event_disconnect');
-        
-        isConnectedToRPC.value = false;
-        game!.is_running = false;
-        currentlyPlaying.value = null;
-        isConnecting.value = false;
+    if (!game) {
+        showDialog('no_game_selected');
         return;
     }
     showDialog('rpc_message_1');
@@ -329,50 +343,36 @@ async function continueRPCRisk(game: Game | null) {
     if (!game) {
         return;
     }
-    const gameUid = game.uid;
-    const gameToTest = gameList.value.find(g => g.uid === gameUid);
-    if (gameToTest) {
-        console.log('Testing RPC for game:', gameToTest);
-        isConnecting.value = true;
-        // invoke('connect_to_discord_rpc_2', { app_id: gameToTest.id, discord_state: "connect" })
-        invoke('connect_to_discord_rpc_3', {
+    const gameToTest = gameList.value.find(g => g.uid === game.uid);
+    if (!gameToTest) {
+        return;
+    }
+
+    hideDialog();
+    isConnecting.value = true;
+    try {
+        await invoke('connect_to_discord_rpc_3', {
             activity_json: JSON.stringify({
                 app_id: gameToTest.id,
             }),
             action: 'connect',
-        })
-        .then(() => {
-            isConnectedToRPC.value = true;
-            gameToTest.is_running = true;
-            currentlyPlaying.value = gameToTest.id;
-            isConnecting.value = false;
-        })
-
-        hideDialog();
+        });
+    } catch (error) {
+        isConnecting.value = false;
+        addLog('error', `Could not start the Discord connection: ${String(error)}`);
     }
 }
 
-function handleSearchBlur() {
-    setTimeout(() => {
-        if (!isOnSearchResults.value) {
-            searchResultsIsOpen.value = false;
-        }
-    }, 200);
-}
-
 function showDialog(message: DialogKey) {
-    isDialogOpen.value = true;
-    dialogMessage.value = message;
     dialogKey.value = message;
-    if(!isEmpty(message)) {
+    if (message !== 'none') {
         dialogRef.value?.showModal();
     }
 }
 
 function hideDialog() {
-    dialogRef.value?.close(); 
-    dialogMessage.value = '';
-    isDialogOpen.value = false;
+    dialogRef.value?.close();
+    dialogKey.value = 'none';
 }
 
 
@@ -519,7 +519,7 @@ provide<GameActionsProvider>(GameActionsKey, {
                <div>
                  <input v-model="searchQuery" type="text" placeholder="Search Discord Verified games..."
                     class="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:text-white"
-                    @focus="openSearchResults" @blur="handleSearchBlur" />
+                    @focus="openSearchResults" />
 
                 <!-- buttons to refetch game list -->
                 <button
@@ -530,7 +530,7 @@ provide<GameActionsProvider>(GameActionsKey, {
                     </span>
                 </button>   
                </div>
-                <div v-if="searchResultsIsOpen" @click="isOnSearchResults = true"
+                <div v-if="searchResultsIsOpen"
                     class="absolute z-50 mt-1 w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto">
                     <div v-if="searchResults.length > 0">
                         <div v-for="game in searchResults" :key="game.item.id"
@@ -541,7 +541,7 @@ provide<GameActionsProvider>(GameActionsKey, {
                                         {{ game.item.name }}
                                     </div>
                                     <div class="text-sm text-gray-500 dark:text-gray-400">ID: {{ game.item.id }}</div>
-                                    <div class="text-xs text-gray-500 dark:text-gray-400">
+                                    <div class="text-xs text-gray-500 dark:text-gray-400" v-if="gameHasWindowsExecutables(game.item)">
                                         Executables:
                                         <ul class="list-disc list-inside">
                                             <li v-for="exe in game.item.executables" :key="exe.name"
@@ -551,6 +551,9 @@ provide<GameActionsProvider>(GameActionsKey, {
                                                 ({{ exe.os }})</span>
                                             </li>
                                         </ul>
+                                    </div>
+                                    <div class="text-xs text-amber-600 dark:text-amber-400 mt-1" v-else>
+                                        No executables from Discord — needs Steam workaround
                                     </div>
                                 </div>
                                 <button @click="addGameToList(game.item)"
@@ -618,7 +621,7 @@ provide<GameActionsProvider>(GameActionsKey, {
             </div>
 
             <!-- Right Column: Game Actions (fixed position) -->
-            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow md:sticky md:top-4 self-start" :key="forceRerenderKey">
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow md:sticky md:top-4 self-start">
                 <h2 class="text-xl font-bold text-gray-900 dark:text-white mb-4">Game Actions</h2>
                 <div class="space-y-4">
                     <div class="text-gray-500 dark:text-gray-400 mb-2 text-sm" v-if="!selectedGame || selectedGame === null">
@@ -638,44 +641,20 @@ provide<GameActionsProvider>(GameActionsKey, {
                     </div>
                     <button @click="handleTestRPC(selectedGame)"
                         class="w-full py-2 rounded-lg bg-gray-600 hover:bg-gray-700 text-white">
-                        {{ isConnecting || isConnectedToRPC ? 'Disconnect to Discord Gateway' : 'Test RPC' }}
+                        {{ isConnecting ? 'Connecting...' : isConnectedToRPC ? 'Disconnect from Discord Gateway' : 'Test RPC' }}
                     </button>
-
-                    <!-- <button :disabled="!canCreateDummyGame(selectedGame)" @click="createDummyGame(selectedGame)" class="w-full py-2 rounded-lg"
-                        :class="[
-                            canCreateDummyGame(selectedGame)
-                                ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
-                                : 'bg-indigo-400 cursor-not-allowed text-gray-200'
-                        ]">
-                        Create Dummy Game
-                    </button> -->
 
                     <!-- divider -->
                     <div class="border-t border-gray-200 dark:border-gray-700 my-4"></div>
 
-                    <GameExecutables v-if="selectedGame" :game="selectedGame" 
+                    <GameExecutables v-if="selectedGame && selectedGameHasWinExes" :game="selectedGame" 
                         @play="playGame"
                         @stop="stopPlaying"
                         @install_and_play="installAndPlay"
                     />
-
-                    <!-- <button @click="playGame(selectedGame)" :disabled="!canPlayGame(selectedGame)"
-                        class="w-full py-2 rounded-lg" :class="[
-                            !canPlayGame(selectedGame)
-                                ? 'bg-green-400 cursor-not-allowed text-gray-100'
-                                : 'bg-green-600 hover:bg-green-600 text-white'
-                        ]">
-                        {{ currentlyPlaying === selectedGame?.id ? 'Playing...' : 'Play' }}
-                    </button>
-
-                    <button @click="stopPlaying(selectedGame)" :disabled="!selectedGame?.is_running" :class="[
-                        'w-full py-2 rounded-lg',
-                        !selectedGame?.is_running
-                            ? 'bg-gray-400 cursor-not-allowed text-gray-200'
-                            : 'bg-red-600 hover:bg-red-700 text-white'
-                    ]">
-                        Stop Playing
-                    </button> -->
+                    <SteamQuestHelper v-else-if="selectedGame" :game="selectedGame"
+                        @running-change="handleSteamRunningChange"
+                    />
                 </div>
 
                 <!-- Divider -->
@@ -695,27 +674,6 @@ provide<GameActionsProvider>(GameActionsKey, {
                     </div>
                 </div>
 
-                <div v-if="selectedGame" class="my-4">
-                    <h3 class="font-medium text-gray-800 dark:text-white mb-2">Game Info</h3>
-                    <!-- Game info -->
-                    <!-- <div class="text-sm text-gray-500 dark:text-gray-400 mb-2">
-                    
-                        <strong>Aliases:</strong>
-                        <ul class="list-disc list-inside">
-                            <li v-for="alias in selectedGame.aliases" :key="alias"
-                                class="text-gray-500 dark:text-gray-400">
-                                <span class="font-mono">{{ alias }}</span>
-                            </li>
-                        </ul>
-                        <strong>Executables:</strong>
-                        <ul class="list-disc list-inside">
-                            <li v-for="exe in getExecutables(selectedGame)" :key="exe"
-                                class="text-gray-500 dark:text-gray-400">
-                                <span class="font-mono">{{ exe }}</span>
-                            </li>
-                        </ul>
-                    </div> -->
-                </div>
             </div>
         </div>
     </div>

@@ -89,6 +89,7 @@ EBWebView
 - Simulate playing verified Discord games without intalling a full game!
 - Complete Discord Quests requiring 15-minute gameplay (not yet tested for Stream the game Quests)
 - Only Discord Verified games are supported. The application fetches a list of games that Discord can automatically detect.
+- **Steam workaround** for games that Discord no longer lists executables for (see [issue #48](https://github.com/markterence/discord-quest-completer/issues/48)): the app can place the dummy executable inside your Steam library together with a minimal `appmanifest_*.acf` file so quest progress counts again. See [Steam workaround](#-steam-workaround-games-without-executables).
 
 ## ⚙️ How It Works
 
@@ -96,6 +97,43 @@ This app creates small executable files that mimic the actual game processes tha
 When launched/played, the tiny executables trigger Discord's Rich Presence/Registed Games detection. Discord checks if Game exe name is running, sometimes it needs to be a folder where the game is supposed to be, thats how mainly it detects the Games, we can clearly see this on the "Registered Games" in the settings.
 
 The dummy game executale files used by this program are placed in a folder called  `games/` folder relative to the main application's exe. As of release build v2025.10.07 the dummy executable file size is around 250kb, it could be smaller but it requires the end-users to install .NET Framework Runtime (which is sometimes comes pre-installed on an up-to-date Windows 11 PC's, so for now the dummy exe using WinAPI through C++ for compatibility rather than C#)
+
+## 🎮 Steam workaround (games without executables)
+
+Around March 2026 Discord changed how quest game detection works for many newer games
+(see [issue #48](https://github.com/markterence/discord-quest-completer/issues/48)):
+their entries in Discord's detectable-games list no longer include the `executables`
+field, so there is nothing left to fake with the classic approach above. Reported
+examples: **Marathon**, **Forza Horizon 6**, **Enginefall**, and many more.
+
+The community-verified workaround uses Steam's install detection:
+
+1. The dummy executable is placed in your Steam library:  
+   `<steamapps>\common\<install_dir>\<GameExe>.exe`
+2. A minimal `appmanifest_<app_id>.acf` file is written to `<steamapps>\` describing
+   the (fake) installation (`appid`, `name`, `installdir`).
+3. Running the dummy exe from that folder makes quest progress count — Steam itself
+   may even stay closed, but it must be **installed**.
+
+Since v2026.07.30 this app automates all of it from the game actions panel when the
+selected game has no executables from Discord:
+
+- Steam library folders are auto-detected (registry + `libraryfolders.vdf`).
+- Known quest games (Marathon, Forza Horizon 6, Enginefall) are pre-filled from
+  bundled data; for anything else, look up the `installdir` and launch executable on
+  [SteamDB](https://steamdb.info/) (`https://steamdb.info/app/<appid>/config/`) and
+  type them in.
+- **Safety:** the app never overwrites an existing `appmanifest_*.acf` or a folder it
+  did not create (tracked via a `.dqc-steam.json` marker). *Remove* only deletes files
+  that the app itself made, so a real game installation is always left untouched.
+- If Steam starts "updating"/verifying the fake game, cancel it and disable automatic
+  updates in Steam settings while the dummy is installed.
+
+> [!NOTE]
+> Games that are not distributed through Steam (no Steam AppID in their Discord
+> entry, e.g. Arknights' standalone client) are out of scope for this workaround.
+
+---
 
 > [!TIP]
 > After launching some games over a period of time, those files may accumulate. For a little maintenance, you can manually delete the created folders under the `games/` folder if you need to.
@@ -192,6 +230,23 @@ pnpm tauri dev
 ```
 
 - Also, get the list of detecatable games from the Discord API: `GET /api/applications/detectable` or `GET /api/:version/applications/detectable` and place the JSON file in `src/assets/gamelist.json`
+
+### 🐧➜🪟 Cross-compiling the Windows build from Linux
+
+Tauri's production mode is only enabled through the Tauri CLI (it passes the
+`custom-protocol` feature to the `tauri` crate). A plain `cargo build --release`
+produces a **dev-mode** binary whose webview tries to reach
+`http://localhost:1420` and shows "localhost refused to connect". When
+cross-compiling with [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)
+(requires `clang`, `lld` and `llvm-rc`), always go through the CLI so the
+correct features are enabled:
+
+```bash
+pnpm install && pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
+```
+
+You can verify the result with `grep -m1 'cargo:dev=' target/**/build/tauri-*/output` –
+it must print `cargo:dev=false` for a production build.
 
 
 ---

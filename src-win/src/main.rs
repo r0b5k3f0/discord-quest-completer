@@ -8,8 +8,9 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::Graphics::Gdi::{GetDC, GetStockObject, GetTextExtentPoint32A, ReleaseDC, SetBkMode, HDC, NULL_BRUSH, TRANSPARENT};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA};
 use windows::core::{PCSTR};
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 use std::env;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 mod tray;
 use tray::create_tray_icon;
@@ -18,8 +19,26 @@ const WIDTH: i32 = 400;
 const HEIGHT: i32 = 400;
 const LINK_BUTTON_ID: i32 = 1001;
 
-static mut TITLE_LABEL: Option<HWND> = None;
-static mut LINK_LABEL: Option<HWND> = None;
+/// Handle of the "Source on Github" button, needed by `WM_SIZE` to keep it
+/// anchored to the bottom-left. Stored as a raw pointer in an atomic rather
+/// than a `static mut`, whose references are deprecated as of the 2024 edition.
+static LINK_LABEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+fn set_link_label(hwnd: Option<HWND>) {
+    LINK_LABEL.store(
+        hwnd.map(|h| h.0).unwrap_or(std::ptr::null_mut()),
+        Ordering::Relaxed,
+    );
+}
+
+fn link_label() -> Option<HWND> {
+    let ptr = LINK_LABEL.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(HWND(ptr))
+    }
+}
 
 #[derive(Debug)]
 struct Config {
@@ -148,21 +167,22 @@ fn create_link_label(parent_hwnd: HWND, text: &str, instance: HINSTANCE) -> Opti
 
 // Helper function to reposition the link label to bottom-left
 fn position_link_label(parent_hwnd: HWND) {
+    let Some(link_hwnd) = link_label() else {
+        return;
+    };
     unsafe {
-        if let Some(link_hwnd) = LINK_LABEL {
-            let mut rect = RECT::default();
-            if GetClientRect(parent_hwnd, &mut rect).is_ok() {
-                let client_height = rect.bottom - rect.top;
-                // Position 10 pixels from left, 30 pixels from bottom
-                let _ = SetWindowPos(
-                    link_hwnd,
-                    None,
-                    10,                    // x position
-                    client_height - 40,    // y position (40 pixels from bottom)
-                    0, 0,                  // width/height (ignored with SWP_NOSIZE)
-                    SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
-                );
-            }
+        let mut rect = RECT::default();
+        if GetClientRect(parent_hwnd, &mut rect).is_ok() {
+            let client_height = rect.bottom - rect.top;
+            // Position 10 pixels from left, 40 pixels from bottom
+            let _ = SetWindowPos(
+                link_hwnd,
+                None,
+                10,                    // x position
+                client_height - 40,    // y position (40 pixels from bottom)
+                0, 0,                  // width/height (ignored with SWP_NOSIZE)
+                SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+            );
         }
     }
 }
@@ -280,27 +300,22 @@ fn main() {
     };
     
     // Create a Windows label to display the title at the top
-    let title_label_hwnd = create_label(hwnd, &config.title, instance,10,  // x position
-            40,  // y position  
-           None,
-            20,  // height
+    let _title_label = create_label(hwnd, &config.title, instance, 10, 40, None, 20);
+    let _app_label = create_label(hwnd, "Discord Quest Completer", instance, 10, 10, None, 20);
+    let _note_label = create_label(
+        hwnd,
+        "This program is part of the Discord Quest Completer",
+        instance,
+        10,
+        60,
+        None,
+        20,
     );
 
-    let _app_label_hwnd = create_label(hwnd, "Discord Quest Completer", instance, 10, 10, None, 20);
-    
-        let _app_label_hwnd = create_label(hwnd, "This program is part of the Discord Quest Completer", instance, 10, 60, None, 20);
-    
-
     // Create a link label anchored to the bottom-left
-    let link_label_hwnd = create_link_label(hwnd, "Source on Github", instance);
-    
-    // Store control references in static variables
+    set_link_label(create_link_label(hwnd, "Source on Github", instance));
+
     unsafe {
-        TITLE_LABEL = title_label_hwnd;
-        LINK_LABEL = link_label_hwnd;
-    }
-    
-    unsafe { 
         if config.start_minimized {
             // Only modify window styles when starting minimized
             let ex_style = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);

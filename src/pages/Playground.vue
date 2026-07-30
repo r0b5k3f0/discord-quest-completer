@@ -42,7 +42,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import { useGlobalState } from '@/composables/app-state';
@@ -73,12 +73,14 @@ function discordTest() {
         activity_json: JSON.stringify({
             app_id: appIdCode,
             details: 'Jhabol',
-            // details: 'xmonad -> dwm -> spectrwm -> i3 -> bspwm -> qtile -> hyrpland -> xfce -> gnome -> sway',
             state: "/jhabol",
             activity_kind: ActivityKind.Watching,
             timestamp: createAgoTimestamp('1h 30m')
         }),
         action: 'connect',
+    }).catch((error) => {
+        isConnected.value = false;
+        addLog('error', `Discord test failed: ${String(error)}`);
     });
     isConnected.value = true;
 }
@@ -104,11 +106,6 @@ function createAgoTimestamp(input: string) {
 
     return Math.floor(date.getTime() / 1000);
 }
-
-
-onMounted(() => {
-
-})
 
 </script>
 

@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast feedback: everything that can fail on a typo, without paying for a
+  # full optimized build. Runs on every push and pull request.
+  check:
+    name: Type check & cargo check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Must come before any cargo invocation, and must list both crates:
+      # src-win is a separate workspace with its own target directory.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./src-tauri -> target
+            ./src-win -> target
+          shared-key: check
+
+      # pnpm defaults to --frozen-lockfile whenever CI is set. The lockfile is
+      # allowed to drift here so the repo stays buildable without a local pnpm.
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      # The game list is not committed to the repo. Type checking does not care
+      # what is inside it, only that the module resolves, so a stub is enough
+      # and keeps this job independent of the network.
+      - name: Stub the bundled game list
+        shell: bash
+        run: |
+          mkdir -p src/assets
+          [ -s src/assets/gamelist.json ] || echo '[]' > src/assets/gamelist.json
+
+      - name: Type check frontend
+        run: pnpm exec vue-tsc --noEmit
+
+      - name: cargo check (src-win)
+        working-directory: ./src-win
+        run: cargo check --all-targets
+
+      - name: cargo check (src-tauri)
+        working-directory: ./src-tauri
+        run: cargo check --all-targets
+
+  # The real build. Only on the default branch, tags, or when triggered by
+  # hand, because Windows runners bill at 2x on private repositories.
+  build:
+    name: Build Windows app
+    needs: check
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      github.ref_name == github.event.repository.default_branch
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./src-tauri -> target
+            ./src-win -> target
+          shared-key: build
+
+      - name: Prepare the bundled game list
+        shell: bash
+        env:
+          GAME_LIST_URL: ${{ secrets.GAME_LIST_URL }}
+        run: |
+          # The game list is deliberately not committed (it is ~12 MB), so it
+          # has to be fetched. GAME_LIST_URL is optional: without it the public
+          # mirror the app itself uses is tried, then Discord directly.
+          mkdir -p src/assets
+          sources=()
+          if [ -n "${GAME_LIST_URL:-}" ]; then
+            sources+=("$GAME_LIST_URL")
+          fi
+          sources+=("https://markterence.github.io/discord-quest-completer/detectable.json")
+          sources+=("https://discord.com/api/applications/detectable")
+
+          got=""
+          for url in "${sources[@]}"; do
+            echo "Trying $url"
+            if curl -fsSL --retry 3 --retry-delay 5 -o gamelist.raw.json "$url" && [ -s gamelist.raw.json ]; then
+              got="$url"
+              break
+            fi
+          done
+
+          if [ -n "$got" ]; then
+            echo "Fetched the game list from $got"
+          elif [ -s src/assets/gamelist.json ]; then
+            echo "::warning::All downloads failed, falling back to the copy in the working tree."
+            cp src/assets/gamelist.json gamelist.raw.json
+          else
+            echo "::error::Could not obtain a game list from any source"
+            exit 1
+          fi
+          # Keep only the fields the app reads. Upstream ships 14 per entry
+          # (~12 MB); this copy is compiled into the binary as the offline
+          # fallback, so the other 9 are pure dead weight.
+          jq -c '[.[] | {
+                   id,
+                   name,
+                   aliases: (.aliases // []),
+                   executables: [ (.executables // [])[] | { is_launcher, name, os } ],
+                   third_party_skus: (.third_party_skus // [])
+                 }]' gamelist.raw.json > src/assets/gamelist.json
+          if [ ! -s src/assets/gamelist.json ]; then
+            echo "::error::The game list is empty after filtering"
+            exit 1
+          fi
+          echo "Bundled game list: $(wc -c < src/assets/gamelist.json) bytes (raw: $(wc -c < gamelist.raw.json) bytes)"
+          rm gamelist.raw.json
+
+      # Produces the dummy executable that gets planted as the fake game. It is
+      # gitignored, so it has to be built before Tauri can bundle it.
+      - name: Build the dummy game runner (src-win)
+        working-directory: ./src-win
+        run: cargo build --release
+
+      - name: Stage the runner as a Tauri resource
+        run: pnpm run copy:runner:win
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build the app
+        run: pnpm tauri build
+
+      - name: Stage the portable output
+        shell: bash
+        run: |
+          out="dist-ci/discord-quest-completer-win32-x64"
+          mkdir -p "$out/data"
+          cp src-tauri/target/release/discord-quest-completer.exe "$out"/
+          # Tauri normally mirrors bundle resources next to the binary; fall
+          # back to the staged copy if that ever stops being true.
+          if [ -f src-tauri/target/release/data/src-win.exe ]; then
+            cp src-tauri/target/release/data/src-win.exe "$out/data"/
+          else
+            cp src-tauri/resources/src-win.exe "$out/data"/
+          fi
+          ls -lR "$out"
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: discord-quest-completer-portable
+          retention-days: 14
+          path: dist-ci/discord-quest-completer-win32-x64/
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: discord-quest-completer-installers
+          retention-days: 14
+          if-no-files-found: warn
+          path: src-tauri/target/release/bundle/
