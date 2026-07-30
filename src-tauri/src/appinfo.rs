@@ -108,9 +108,13 @@ pub async fn fetch_steam_appinfo(steam_app_id: u64) -> Result<SteamAppInfo, Stri
         return Err(format!("{} returned HTTP {}", url, status));
     }
 
-    let body: serde_json::Value = response
-        .json()
+    // .text() + from_str instead of .json(): the plugin's reqwest re-export
+    // is built without the `json` feature.
+    let body = response
+        .text()
         .await
+        .map_err(|e| format!("Could not read the appinfo response: {}", e))?;
+    let body: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| format!("Could not parse the appinfo response: {}", e))?;
 
     let app = body
@@ -212,9 +216,11 @@ pub async fn search_steam_apps(query: String) -> Result<Vec<SteamAppSearchResult
         return Err(format!("{} returned HTTP {}", url, status));
     }
 
-    let body: serde_json::Value = response
-        .json()
+    let body = response
+        .text()
         .await
+        .map_err(|e| format!("Could not read the Steam search response: {}", e))?;
+    let body: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| format!("Could not parse the Steam search response: {}", e))?;
 
     let results = body
