@@ -204,3 +204,49 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
           path: src-tauri/target/release/bundle/
+
+  # Publishing: pushing a tag like v26.8.1 turns that build into a GitHub
+  # Release with the portable zip and the installers attached. Ordinary
+  # branch pushes stop at the artifact stage above.
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download portable build
+        uses: actions/download-artifact@v4
+        with:
+          name: discord-quest-completer-portable
+          path: portable/discord-quest-completer-win32-x64
+
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          name: discord-quest-completer-installers
+          path: installers
+
+      - name: Package release files
+        shell: bash
+        run: |
+          mkdir -p release-files
+          # Portable zip, versioned after the tag.
+          (cd portable && zip -r "../release-files/discord-quest-completer-win32-x64-${GITHUB_REF_NAME}.zip" discord-quest-completer-win32-x64)
+          # MSI / NSIS installers live in bundle sub folders; flatten them.
+          find installers -type f \( -name '*.msi' -o -name '*.exe' \) -exec cp {} release-files/ \;
+          ls -l release-files
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-files/*
+          body: |
+            #### Disclaimer
+            This tool is intended for educational purposes and personal use. Please respect Discord's terms of service and game publishers' rights when using this application.
+
+            The creators and maintainers of this project are not liable for any damages, account suspensions, or other consequences that may arise from using this software. Use at your own risk. This project is not affiliated with, endorsed by, or connected to Discord in any way.
+          append_body: true
