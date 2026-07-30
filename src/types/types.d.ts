@@ -50,6 +50,32 @@ export interface SteamDummyStatus {
   exes: string[];
 }
 
+/** One launch entry from Steam's appinfo (see appinfo.rs). */
+export interface SteamLaunchOption {
+  /** Path exactly as Steam lists it, e.g. `game\bin\win64\cs2.exe`. */
+  executable: string;
+  /** File name part only. */
+  filename: string;
+  /** Directory part relative to the install dir; empty when at the top level. */
+  sub_dir: string;
+  launch_type: string;
+}
+
+/** Result of the `fetch_steam_appinfo` command. */
+export interface SteamAppInfo {
+  steam_app_id: number;
+  name?: string | null;
+  install_dir?: string | null;
+  launch: SteamLaunchOption[];
+  gated: boolean;
+}
+
+/** Result of the `search_steam_apps` command. */
+export interface SteamAppSearchResult {
+  appid: string;
+  name: string;
+}
+
 export interface GameActionsProvider {
   canPlayGame: (game: Game | null) => boolean;
   isGameInstalled: (game: Game | null) => boolean;

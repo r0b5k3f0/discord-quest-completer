@@ -19,7 +19,14 @@
  */
 import { computed, nextTick, ref, useTemplateRef, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import type { Game, SteamDummyStatus, SteamLibrary, SteamOverrideEntry } from '@/types/types';
+import type {
+  Game,
+  SteamAppInfo,
+  SteamAppSearchResult,
+  SteamDummyStatus,
+  SteamLibrary,
+  SteamOverrideEntry,
+} from '@/types/types';
 import {
   findSteamOverride,
   getSteamSkus,
@@ -59,6 +66,14 @@ const busyLabel = ref('');
 const errorMsg = ref<string>('');
 const infoMsg = ref<string>('');
 const runningExes = ref<Record<string, boolean>>({});
+
+// Steam appinfo auto-fill (see appinfo.rs)
+const steamFetchBusy = ref(false);
+const steamFetchNote = ref('');
+const nestedExeHint = ref('');
+// Bumped on every lookup and on game switch, so a slow response for the
+// previous game can never fill the form of the current one.
+let steamFetchSeq = 0;
 
 const steamIssueUrl = 'https://github.com/markterence/discord-quest-completer/issues/48';
 const steamDbUrl = computed(() =>
@@ -158,6 +173,12 @@ function prefillFromGame(game: Game) {
   matchedOverride.value = findSteamOverride(game);
   steamSkus.value = getSteamSkus(game);
 
+  // Invalidate any in-flight Steam lookup for the previous game.
+  steamFetchSeq++;
+  steamFetchBusy.value = false;
+  steamFetchNote.value = '';
+  nestedExeHint.value = '';
+
   if (matchedOverride.value) {
     steamAppId.value = matchedOverride.value.steam_app_id;
     installDir.value = matchedOverride.value.install_dir;
@@ -171,10 +192,90 @@ function prefillFromGame(game: Game) {
     if (!steamAppId.value) {
       addLog('warning', `'${game.name}' has no Steam AppID listed by Discord.`);
     } else {
+      // Discord gave us the AppID, so the rest can usually be pulled from
+      // Steam's appinfo automatically. Fire and forget; the fallback is the
+      // sanitized guess already in the fields.
+      void fetchFromSteam(true);
+    }
+  }
+}
+
+/**
+ * Pulls install dir + launch executables from Steam's appinfo (the same data
+ * SteamDB's /config/ page shows) and fills the form. When the AppID field is
+ * empty it first resolves the AppID by searching Steam for the game's name.
+ *
+ * Everything here is best-effort: api.steamcmd.net is a third-party service,
+ * so any failure just leaves the form as it was for manual entry.
+ */
+async function fetchFromSteam(auto = false) {
+  const seq = ++steamFetchSeq;
+  steamFetchBusy.value = true;
+  steamFetchNote.value = '';
+  try {
+    let appId = steamAppId.value.trim();
+
+    if (!/^\d+$/.test(appId)) {
+      const results = await invoke<SteamAppSearchResult[]>('search_steam_apps', {
+        query: props.game.name,
+      });
+      if (seq !== steamFetchSeq) return;
+      const lower = props.game.name.trim().toLowerCase();
+      const match = results.find((r) => r.name.trim().toLowerCase() === lower) ?? results[0];
+      if (!match) {
+        steamFetchNote.value = 'Could not find this game on Steam - enter the AppID manually.';
+        return;
+      }
+      appId = match.appid;
+      steamAppId.value = appId;
+      addLog(`Steam search matched '${match.name}' (AppID ${appId}).`);
+    }
+
+    const info = await invoke<SteamAppInfo>('fetch_steam_appinfo', {
+      steam_app_id: Number(appId),
+    });
+    if (seq !== steamFetchSeq) return;
+
+    if (!info.install_dir) {
+      steamFetchNote.value = info.gated
+        ? "Steam only shows this game's install info to owners - fill it in from SteamDB manually."
+        : 'Steam returned no install info for this AppID - fill it in from SteamDB manually.';
+      addLog('warning', `Steam appinfo for AppID ${appId} has no public install dir.`);
+      return;
+    }
+
+    installDir.value = info.install_dir;
+    // appinfo.rs puts the entry Steam's Play button uses first.
+    const defaultLaunch = info.launch[0];
+    if (defaultLaunch) {
+      exeNamesText.value = defaultLaunch.filename;
+    }
+    steamFetchNote.value = `Filled from Steam${info.name ? ` ('${info.name}')` : ''}.`;
+    addLog(
+      `Steam appinfo for AppID ${appId}: installdir '${info.install_dir}'` +
+        (defaultLaunch ? `, default exe '${defaultLaunch.executable}'.` : ', no Windows exe listed.'),
+    );
+
+    // The installer only writes plain file names into <install_dir>. When Steam
+    // nests the real binary (CS2, Helldivers 2), the dummy would land in a
+    // place Discord does not look, so say so rather than fail silently.
+    nestedExeHint.value = defaultLaunch?.sub_dir
+      ? `Steam lists this exe at ${info.install_dir}\\${defaultLaunch.executable}. This tool can only place it directly in ${info.install_dir}\\, so detection may not trigger for this game.`
+      : '';
+
+    const alternatives = info.launch.slice(1).map((l) => l.filename);
+    if (alternatives.length) {
       addLog(
-        'warning',
-        `No bundled data for '${game.name}'. Check SteamDB for the correct install dir and exe name.`,
+        `Other Steam launch executables: ${alternatives.join(', ')} - add them (comma separated) if the default alone is not detected.`,
       );
+    }
+  } catch (e) {
+    if (seq !== steamFetchSeq) return;
+    steamFetchNote.value = 'Steam lookup failed - fill the fields in manually (see SteamDB).';
+    if (!auto) addLog('warning', `Steam lookup failed: ${String(e)}`);
+  } finally {
+    if (seq === steamFetchSeq) {
+      steamFetchBusy.value = false;
     }
   }
 }
@@ -434,11 +535,28 @@ findLibraries();
         class="w-full px-2 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white text-xs font-mono" />
     </div>
 
+    <!-- Auto-fill from Steam appinfo -->
+    <div class="flex items-center gap-2 mb-2">
+      <button :disabled="steamFetchBusy || busy" @click="fetchFromSteam()"
+        class="px-3 py-1.5 rounded-md text-xs text-white whitespace-nowrap"
+        :class="(steamFetchBusy || busy) ? 'bg-sky-400 cursor-not-allowed' : 'bg-sky-600 hover:bg-sky-700'">
+        {{ steamFetchBusy ? 'Fetching from Steam...' : 'Fetch from Steam' }}
+      </button>
+      <span v-if="steamFetchNote" class="text-xs">{{ steamFetchNote }}</span>
+    </div>
+
+    <!-- Steam nests the real binary in a sub folder for some games -->
+    <div v-if="nestedExeHint"
+      class="text-xs mb-2 p-2 rounded-md border border-amber-400/50 bg-amber-500/10 text-amber-700 dark:text-amber-400">
+      {{ nestedExeHint }}
+    </div>
+
     <p class="text-xs mb-3" v-if="matchedOverride">
       ✓ Using bundled data for this game ({{ matchedOverride.name }}).
     </p>
     <p class="text-xs mb-3" v-else>
-      No bundled data. Find the correct values on
+      No bundled data. "Fetch from Steam" fills these fields automatically for
+      most games; otherwise find the values on
       <a :href="steamDbUrl" target="_blank" class="underline text-indigo-500 dark:text-indigo-400">SteamDB</a>:
       look for <em>installdir</em> and the default launch option's <em>Executable</em>.
     </p>

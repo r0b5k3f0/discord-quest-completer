@@ -5,6 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 use tauri::async_runtime::JoinHandle;
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Listener, Manager};
 
+mod appinfo;
 mod gamelist;
 mod rpc;
 mod runner;
@@ -210,6 +211,8 @@ pub fn run() {
             connect_to_discord_rpc_3,
             run_background_process,
             gamelist::fetch_gamelist,
+            appinfo::fetch_steam_appinfo,
+            appinfo::search_steam_apps,
             steam::find_steam_libraries,
             steam::install_steam_dummy_game,
             steam::get_steam_dummy_status,
