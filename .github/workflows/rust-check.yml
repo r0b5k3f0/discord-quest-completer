@@ -66,7 +66,7 @@ jobs:
           if [ -n "${GAME_LIST_URL:-}" ]; then
             sources+=("$GAME_LIST_URL")
           fi
-          sources+=("https://markterence.github.io/discord-quest-completer/detectable.json")
+          sources+=("https://r0b5k3f0.github.io/discord-quest-completer/detectable_v10.json")
           sources+=("https://discord.com/api/applications/detectable")
 
           for url in "${sources[@]}"; do
