@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 const GH_MIRROR_URL: &str =
-    "https://markterence.github.io/discord-quest-completer/detectable.json";
+    "https://r0b5k3f0.github.io/discord-quest-completer/detectable_v10.json";
 const DISCORD_URL: &str = "https://discord.com/api/applications/detectable";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
