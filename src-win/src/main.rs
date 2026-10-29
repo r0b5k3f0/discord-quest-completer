@@ -18,21 +18,25 @@ use tray::create_tray_icon;
 const WIDTH: i32 = 400;
 const HEIGHT: i32 = 400;
 const LINK_BUTTON_ID: i32 = 1001;
+const FORK_BUTTON_ID: i32 = 1002;
 
-/// Handle of the "Source on Github" button, needed by `WM_SIZE` to keep it
+/// Handles of the source and fork buttons, needed by `WM_SIZE` to keep them
 /// anchored to the bottom-left. Stored as a raw pointer in an atomic rather
 /// than a `static mut`, whose references are deprecated as of the 2024 edition.
-static LINK_LABEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static LINK_LABELS: [AtomicPtr<c_void>; 2] = [
+    AtomicPtr::new(std::ptr::null_mut()),
+    AtomicPtr::new(std::ptr::null_mut()),
+];
 
-fn set_link_label(hwnd: Option<HWND>) {
-    LINK_LABEL.store(
+fn set_link_label(index: usize, hwnd: Option<HWND>) {
+    LINK_LABELS[index].store(
         hwnd.map(|h| h.0).unwrap_or(std::ptr::null_mut()),
         Ordering::Relaxed,
     );
 }
 
-fn link_label() -> Option<HWND> {
-    let ptr = LINK_LABEL.load(Ordering::Relaxed);
+fn link_label(index: usize) -> Option<HWND> {
+    let ptr = LINK_LABELS[index].load(Ordering::Relaxed);
     if ptr.is_null() {
         None
     } else {
@@ -138,7 +142,7 @@ fn create_label(parent_hwnd: HWND, text: &str, instance: HINSTANCE, x: i32, y:i3
     }
 }
 
-fn create_link_label(parent_hwnd: HWND, text: &str, instance: HINSTANCE) -> Option<HWND> {
+fn create_link_label(parent_hwnd: HWND, text: &str, instance: HINSTANCE, button_id: i32) -> Option<HWND> {
     unsafe {
         let class_name = CString::new("BUTTON").ok()?;
         let window_text = CString::new(text).ok()?;
@@ -153,7 +157,7 @@ fn create_link_label(parent_hwnd: HWND, text: &str, instance: HINSTANCE) -> Opti
             150,   // width
             25,    // height
             Some(parent_hwnd), // Parent window
-            Some(HMENU(LINK_BUTTON_ID as _)), // Menu/ID
+            Some(HMENU(button_id as _)), // Menu/ID
             Some(instance), // Instance handle
             None, // Additional application data
         );
@@ -165,24 +169,24 @@ fn create_link_label(parent_hwnd: HWND, text: &str, instance: HINSTANCE) -> Opti
     }
 }
 
-// Helper function to reposition the link label to bottom-left
-fn position_link_label(parent_hwnd: HWND) {
-    let Some(link_hwnd) = link_label() else {
-        return;
-    };
+// Keep both buttons stacked at the bottom-left, including after resizing.
+fn position_link_labels(parent_hwnd: HWND) {
     unsafe {
         let mut rect = RECT::default();
         if GetClientRect(parent_hwnd, &mut rect).is_ok() {
             let client_height = rect.bottom - rect.top;
-            // Position 10 pixels from left, 40 pixels from bottom
-            let _ = SetWindowPos(
-                link_hwnd,
-                None,
-                10,                    // x position
-                client_height - 40,    // y position (40 pixels from bottom)
-                0, 0,                  // width/height (ignored with SWP_NOSIZE)
-                SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
-            );
+            for index in 0..LINK_LABELS.len() {
+                if let Some(link_hwnd) = link_label(index) {
+                    let _ = SetWindowPos(
+                        link_hwnd,
+                        None,
+                        10,
+                        client_height - 75 + index as i32 * 35,
+                        0, 0, // Preserve the button size.
+                        SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
+                    );
+                }
+            }
         }
     }
 }
@@ -206,14 +210,18 @@ unsafe extern "system" fn window_proc(
             LRESULT(GetStockObject(NULL_BRUSH).0 as isize)
         }
         WM_SIZE => {
-            // Reposition the link label when window is resized
-            position_link_label(hwnd);
+            // Reposition both link buttons when the window is resized
+            position_link_labels(hwnd);
             DefWindowProcA(hwnd, msg, wparam, lparam)
         } 
         WM_COMMAND => { 
             let control_id = wparam.0 & 0xFFFF;
-            if control_id == LINK_BUTTON_ID as usize { 
-                let url = windows::core::w!("https://github.com/markterence/discord-quest-completer");
+            let url = match control_id as i32 {
+                LINK_BUTTON_ID => Some(windows::core::w!("https://github.com/markterence/discord-quest-completer")),
+                FORK_BUTTON_ID => Some(windows::core::w!("https://github.com/r0b5k3f0/discord-quest-completer")),
+                _ => None,
+            };
+            if let Some(url) = url {
                 let operation = windows::core::w!("open");
                 let _ = ShellExecuteW(
                     None,
@@ -312,8 +320,10 @@ fn main() {
         20,
     );
 
-    // Create a link label anchored to the bottom-left
-    set_link_label(create_link_label(hwnd, "Source on Github", instance));
+    // Create both repository buttons and position them before the window is shown.
+    set_link_label(0, create_link_label(hwnd, "Source on Github", instance, LINK_BUTTON_ID));
+    set_link_label(1, create_link_label(hwnd, "Fork on Github", instance, FORK_BUTTON_ID));
+    position_link_labels(hwnd);
 
     unsafe {
         if config.start_minimized {
