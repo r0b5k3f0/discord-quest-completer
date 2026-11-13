@@ -115,7 +115,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ matrix.args }}
-      
+
+      # `resources/src-win.exe` is inlined into the MSI/NSIS installers, so the
+      # bundler does not leave a copy at target/release/data/. Stage one here so
+      # the artifact below always contains it, independent of the build cache.
+      - name: Stage the runner resource next to the binary
+        shell: bash
+        run: |
+          src="src-tauri/resources/src-win.exe"
+          if [ ! -s "$src" ]; then
+            echo "::error::$src is missing, cannot stage data/src-win.exe"
+            exit 1
+          fi
+          mkdir -p src-tauri/target/release/data
+          cp "$src" src-tauri/target/release/data/src-win.exe
+          echo "Staged src-tauri/target/release/data/src-win.exe"
+
       - name: Create artifact for release
         id: create_artifact_for_release
         uses: actions/upload-artifact@v4
@@ -149,11 +164,22 @@ jobs:
           version: ${{ env.version }}
           win_build_release_dir: discord-quest-completer-win32-x64-${{ env.version }}
         run: |
+          set -euo pipefail
           mkdir -p ./build/${{ env.win_build_release_dir }}
           cp tauri-win-release/discord-quest-completer.exe ./build/${{ env.win_build_release_dir }}/
-          cp -r tauri-win-release/data/ ./build/${{ env.win_build_release_dir }}/
-          cp -r tauri-win-release/resources/ ./build/${{ env.win_build_release_dir }}/
+          # `data/` and `resources/` are optional parts of the artifact.
+          for extra in data resources; do
+            if [ -d "tauri-win-release/$extra" ]; then
+              cp -r "tauri-win-release/$extra" ./build/${{ env.win_build_release_dir }}/
+            else
+              echo "::warning::tauri-win-release/$extra is missing, skipping it"
+            fi
+          done
           zip -r ./build/${{ env.win_build_release_dir }}.zip ./build/${{ env.win_build_release_dir }}
+          if [ ! -f "./build/${{ env.win_build_release_dir }}/data/src-win.exe" ]; then
+            echo "::error::data/src-win.exe is missing from the portable build"
+            exit 1
+          fi
           echo "win_build_release_dir=${{ env.win_build_release_dir }}" >> $GITHUB_ENV
 
       - name: Create Build Artifacts

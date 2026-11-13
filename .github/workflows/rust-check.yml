@@ -102,6 +102,27 @@ jobs:
           args: ${{ matrix.args }}
           includeDebug: true
 
+      # The bundled runner is a `bundle.resources` entry, so the bundler copies
+      # it into the MSI/NSIS installers but does not leave a copy in
+      # target/<profile>/data/. Historically that folder only existed because
+      # rust-cache restored an old target directory; on a cold cache the
+      # release-check job then died on `cp -r tauri-win-release/data/`.
+      # Stage it explicitly so the uploaded artifact does not depend on cache.
+      - name: Stage the runner resource next to the binaries
+        shell: bash
+        run: |
+          src="src-tauri/resources/src-win.exe"
+          if [ ! -s "$src" ]; then
+            echo "::error::$src is missing, cannot stage data/src-win.exe"
+            exit 1
+          fi
+          for profile in release debug; do
+            dir="src-tauri/target/$profile/data"
+            mkdir -p "$dir"
+            cp "$src" "$dir/src-win.exe"
+            echo "Staged $dir/src-win.exe ($(wc -c < "$dir/src-win.exe") bytes)"
+          done
+
       - name: Create artifact for release
         id: create_artifact_for_release
         uses: actions/upload-artifact@v4
@@ -152,16 +173,41 @@ jobs:
           win_build_release_dir: discord-quest-completer-win32-x64-${{ env.version }}
           win_build_debug_dir: discord-quest-completer-win32-x64-debug-${{ env.version }}
         run: |
-          mkdir -p ./build/${{ env.win_build_release_dir }}
-          cp tauri-win-release/discord-quest-completer.exe ./build/${{ env.win_build_release_dir }}/
-          cp -r tauri-win-release/data/ ./build/${{ env.win_build_release_dir }}/
-          cp -r tauri-win-release/resources/ ./build/${{ env.win_build_release_dir }}/
+          set -euo pipefail
+
+          # Copies an artifact folder into the portable release layout. `data/`
+          # and `resources/` are optional (the bundler may inline them), so a
+          # missing one is a warning, not a hard failure. The executable is not
+          # optional.
+          stage() {
+            local src_dir="$1"
+            local dst_dir="$2"
+
+            mkdir -p "$dst_dir"
+            if [ ! -f "$src_dir/discord-quest-completer.exe" ]; then
+              echo "::error::$src_dir/discord-quest-completer.exe is missing"
+              return 1
+            fi
+            cp "$src_dir/discord-quest-completer.exe" "$dst_dir"/
+
+            local extra
+            for extra in data resources; do
+              if [ -d "$src_dir/$extra" ]; then
+                cp -r "$src_dir/$extra" "$dst_dir"/
+              else
+                echo "::warning::$src_dir/$extra is missing, skipping it"
+              fi
+            done
+          }
+
+          stage tauri-win-release "./build/${{ env.win_build_release_dir }}"
+          if [ ! -f "./build/${{ env.win_build_release_dir }}/data/src-win.exe" ]; then
+            echo "::error::data/src-win.exe did not make it into tauri-win-release, refusing to publish an incomplete portable build"
+            exit 1
+          fi
           zip -r ./build/${{ env.win_build_release_dir }}.zip ./build/${{ env.win_build_release_dir }}
-          
-          mkdir -p ./build/${{ env.win_build_debug_dir }}
-          cp tauri-win-debug/discord-quest-completer.exe ./build/${{ env.win_build_debug_dir }}/
-          cp -r tauri-win-debug/data/ ./build/${{ env.win_build_debug_dir }}/
-          cp -r tauri-win-debug/resources/ ./build/${{ env.win_build_debug_dir }}/
+
+          stage tauri-win-debug "./build/${{ env.win_build_debug_dir }}"
           # zip -r ./build/${{ env.win_build_debug_dir }}.zip ./build/${{ env.win_build_debug_dir }}
 
           echo "win_build_release_dir=${{ env.win_build_release_dir }}" >> $GITHUB_ENV
